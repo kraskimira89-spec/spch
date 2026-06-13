@@ -31,6 +31,7 @@ from openpyxl.utils import get_column_letter
 
 ROOT = Path(__file__).resolve().parents[1]
 TZ_DOCX = ROOT / "ТЗ контент.docx"
+TZ_PDF = ROOT / "ТЗ контент.pdf"
 OUT = ROOT / "output" / "Контент-анализ_по_ТЗ"
 
 # === Коды строго по ТЗ (шаг 2.1 + 2.2) ===
@@ -96,76 +97,460 @@ class Statement:
     text_hash: str = ""
 
 
-def extract_text_from_docx(path: Path) -> str:
+CONTINUATION_RE = re.compile(
+    r"^(?:через\b|за\b|по\b|при\b|для\b|с учетом|с уч[её]том|исходя из|в соответствии|"
+    r"привести\b|чтобы\b|котор(?:ый|ая|ое|ые)\b|где\b|а также\b|либо\b|"
+    r"так как\b|потому что\b|то есть\b|например\b)",
+    re.I,
+)
+ACTION_HEADS = (
+    "введение", "внедрение", "повышение", "увеличение", "снижение", "уменьшение",
+    "расширение", "пересмотр", "создание", "формирование", "переход", "компенсация",
+    "отмена", "масштабирование", "индексация", "субсидирование", "планирование",
+    "скорректировать", "изменить", "упростить", "сократить", "обеспечить",
+    "предусмотреть", "предоставить", "выделить", "закрепить", "ввести", "создать",
+    "расширить", "увеличить", "повысить", "пересмотреть", "установить",
+    "унифицировать", "отказаться", "вернуть", "заложить", "открыть",
+)
+
+
+def extract_paragraphs_from_docx(path: Path) -> list[str]:
     import xml.etree.ElementTree as ET
 
     with zipfile.ZipFile(path) as z:
         root = ET.fromstring(z.read("word/document.xml"))
-    parts: list[str] = []
-    for t in root.iter("{http://schemas.openxmlformats.org/wordprocessingml/2006/main}t"):
-        if t.text:
-            parts.append(t.text)
-        if t.tail:
-            parts.append(t.tail)
-    return "".join(parts)
+    ns = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+    paragraphs: list[str] = []
+    for para in root.iter(f"{ns}p"):
+        parts: list[str] = []
+        for t in para.iter(f"{ns}t"):
+            if t.text:
+                parts.append(t.text)
+        text = "".join(parts).strip()
+        if text:
+            paragraphs.append(text)
+    return paragraphs
+
+
+def extract_text_from_docx(path: Path) -> str:
+    # Сохраняем границы абзацев Word, чтобы не склеивать независимые ответы в одну строку.
+    return "\n".join(extract_paragraphs_from_docx(path))
+
+
+def extract_text_from_pdf(path: Path) -> str | None:
+    try:
+        from pypdf import PdfReader
+    except ImportError:
+        return None
+
+    if not path.exists():
+        return None
+
+    reader = PdfReader(str(path))
+    pages: list[str] = []
+    for page in reader.pages:
+        text = page.extract_text() or ""
+        text = text.strip()
+        if text:
+            pages.append(text)
+    return "\n".join(pages)
 
 
 def rough_split(body: str) -> list[str]:
-    body = re.sub(r"([а-яё])(\d+\.)", r"\1 \2", body)
-    body = re.sub(r"(\d+\.)([А-ЯЁ])", r"\1 \2", body)
-    body = re.sub(r"([.!?»\"])([А-ЯЁ])", r"\1 \2", body)
-
-    parts = [body]
-    for pattern in (r"\s*\d+\.\s+", r"\s*[-–—]\s+"):
-        new: list[str] = []
-        for chunk in parts:
-            new.extend(re.split(pattern, chunk))
-        parts = new
-
-    glued: list[str] = []
-    for chunk in parts:
-        glued.extend(re.split(r"(?<=[а-яё])(?=[А-ЯЁ][а-яё])", chunk))
-
     out: list[str] = []
-    for chunk in glued:
-        chunk = re.sub(r"\s+", " ", chunk).strip(" .;")
+    for line in body.splitlines():
+        chunk = re.sub(r"\s+", " ", line).strip()
         if len(chunk) >= 3 and not chunk.lower().startswith("цель:"):
             out.append(chunk)
     return out
 
 
+def normalize_fragment(text: str) -> str:
+    text = re.sub(r"^\d+[\.\)]\s*", "", text.strip())
+    text = re.sub(r"^-\s*", "", text)
+    text = re.sub(r"\s+", " ", text).strip(" .;,-")
+    return text
+
+
+def split_numbered_items(text: str) -> list[str]:
+    starts: list[int] = []
+    for match in re.finditer(r"\d+[\.\)]", text):
+        if match.start() > 0 and not text[match.start() - 1].isspace():
+            continue
+        tail = text[match.end() :]
+        if not tail.strip():
+            continue
+        starts.append(match.start())
+
+    if len(starts) < 2:
+        return [text]
+
+    parts: list[str] = []
+    for idx, start in enumerate(starts):
+        end = starts[idx + 1] if idx + 1 < len(starts) else len(text)
+        parts.append(text[start:end].strip())
+    return parts
+
+
+def split_dash_list(text: str) -> list[str]:
+    if not text.lstrip().startswith("-"):
+        return [text]
+    if text.count(" - ") < 2:
+        return [text]
+    parts: list[str] = []
+    current: list[str] = []
+    paren_depth = 0
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if ch == "(":
+            paren_depth += 1
+        elif ch == ")" and paren_depth > 0:
+            paren_depth -= 1
+
+        if (
+            paren_depth == 0
+            and i + 2 < len(text)
+            and text[i : i + 3] == " - "
+            and current
+        ):
+            chunk = "".join(current).strip()
+            if chunk:
+                parts.append(chunk)
+            current = []
+            i += 3
+            continue
+
+        current.append(ch)
+        i += 1
+
+    tail = "".join(current).strip()
+    if tail:
+        parts.append(tail)
+    return parts or [text]
+
+
+def should_split_before(fragment: str) -> bool:
+    probe = re.sub(r"^[\s\-,:;.]+", "", fragment, flags=re.UNICODE).lower()
+    return any(probe.startswith(head) for head in ACTION_HEADS)
+
+
+def split_top_level_measures(text: str) -> list[str]:
+    parts: list[str] = []
+    current: list[str] = []
+    paren_depth = 0
+
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if ch == "(":
+            paren_depth += 1
+        elif ch == ")" and paren_depth > 0:
+            paren_depth -= 1
+
+        if paren_depth == 0 and ch in ",;":
+            tail = text[i + 1 :]
+            if should_split_before(tail):
+                chunk = "".join(current).strip()
+                if chunk:
+                    parts.append(chunk)
+                current = []
+                i += 1
+                while i < len(text) and text[i].isspace():
+                    i += 1
+                continue
+
+        if paren_depth == 0 and ch in ".!?":
+            tail = text[i + 1 :]
+            probe = tail.lstrip()
+            if should_split_before(probe) or re.match(r"^\d+[\.\)]", probe):
+                chunk = "".join(current).strip()
+                if chunk:
+                    parts.append(chunk)
+                current = []
+                i += 1
+                while i < len(text) and text[i].isspace():
+                    i += 1
+                continue
+
+        current.append(ch)
+        i += 1
+
+    tail_chunk = "".join(current).strip()
+    if tail_chunk:
+        parts.append(tail_chunk)
+    return parts or [text]
+
+
+def split_dirty_measure_runs(text: str) -> list[str]:
+    cleaned = re.sub(r"\s+", " ", text).strip()
+    if ". " not in cleaned:
+        return [text]
+    parts = re.split(
+        r"(?<=\.)\s+(?=(?:уменьшение|повышение|увеличение|компенсация|введение|внедрение|"
+        r"расширение|пересмотр|создание|формирование|переход|индексация|"
+        r"скорректировать|изменить|упростить|сократить|обеспечить|предусмотреть|"
+        r"предоставить|выделить|закрепить|ввести|создать|расширить|увеличить|"
+        r"повысить|пересмотреть|установить|унифицировать|отказаться|вернуть|заложить)\b)",
+        cleaned,
+        flags=re.I,
+    )
+    return [part for part in parts if part.strip()] or [text]
+
+
+def merge_continuations(parts: list[str]) -> list[str]:
+    merged: list[str] = []
+    for part in parts:
+        cleaned = normalize_fragment(part)
+        if len(cleaned) < 3:
+            continue
+        if merged:
+            prev = merged[-1]
+            if CONTINUATION_RE.match(cleaned):
+                merged[-1] = f"{prev} {cleaned}".strip()
+                continue
+        merged.append(cleaned)
+    return merged
+
+
+def split_compound_clauses(text: str) -> list[str]:
+    pieces = split_top_level_measures(text)
+    expanded: list[str] = []
+    for piece in pieces:
+        numbered = split_numbered_items(piece)
+        for item in numbered:
+            expanded.extend(split_dirty_measure_runs(item))
+    if not expanded:
+        return [text]
+    return merge_continuations(expanded)
+
+
 def split_atomic(text: str) -> list[str]:
     """Дробит составное высказывание на атомарные (одна мысль — одна строка)."""
-    chunks = [text]
+    prepared = re.sub(r"\s+", " ", text).strip()
+    chunks = split_numbered_items(prepared)
+    if len(chunks) == 1:
+        chunks = split_dash_list(prepared)
 
-    patterns = [
-        r"(?<=\.)\s*(?=\d+\.\s)",           # 1. ... 2. ...
-        r"(?<=\.)\s*(?=\d+\))",             # 1) 2)
-        r"\s*;\s+",                          # точка с запятой
-        r"(?<=[.!?])\s+(?=[А-ЯЁ«\"])",     # новое предложение
-        r"\s+(?<=[а-яё])\.(?=\s*[А-ЯЁ])",  # точка между предложениями
-    ]
-    for pat in patterns:
-        new_chunks: list[str] = []
-        for c in chunks:
-            new_chunks.extend(re.split(pat, c))
-        chunks = new_chunks
+    secondary: list[str] = []
+    for chunk in chunks:
+        secondary.extend(re.split(r"\s*;\s+", chunk))
+    chunks = merge_continuations(secondary)
 
-    # Списки через «, и » / «; » в длинных фразах
     result: list[str] = []
-    for c in chunks:
-        c = re.sub(r"^\d+[\.\)]\s*", "", c.strip())
-        c = re.sub(r"\s+", " ", c).strip(" .;")
-        if len(c) < 8:
+    for chunk in chunks:
+        subchunks = split_compound_clauses(chunk)
+        for sub in subchunks:
+            cleaned = normalize_fragment(sub)
+            if len(cleaned) >= 8:
+                result.append(cleaned)
+    return result if result else ([normalize_fragment(text)] if text.strip() else [])
+
+
+def normalize_validation_text(text: str) -> str:
+    text = text.lower().replace("ё", "е")
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def count_action_heads(text: str) -> int:
+    low = normalize_validation_text(text)
+    count = 0
+    for head in ACTION_HEADS:
+        if re.search(rf"(^|[.;,]\s+|\d+[.)]\s*){re.escape(head)}\b", low):
+            count += 1
+    return count
+
+
+def classify_pdf_validation_issue(
+    block: str,
+    parts: list[str],
+    matched: bool,
+    action_heads: int,
+) -> dict[str, object] | None:
+    normalized_block = normalize_validation_text(block)
+    normalized_parts = [normalize_validation_text(part) for part in parts if normalize_validation_text(part)]
+    block_len = len(normalized_block)
+    short_count = sum(len(part) < 24 for part in normalized_parts)
+    tiny_count = sum(len(part) < 14 for part in normalized_parts)
+    numbered_items = len(split_numbered_items(block))
+    semicolon_count = block.count(";")
+    has_enumeration_colon = ":" in block and semicolon_count >= 3
+
+    # Короткие односложные ответы PDF часто теряет или искажает; не шумим ими в отчете.
+    if block_len < 45 and action_heads == 0 and len(normalized_parts) <= 1:
+        return None
+
+    # Длинные нумерованные блоки мер часто извлекаются из PDF нестрого, но сама сегментация здесь корректна.
+    if not matched and numbered_items >= 5 and len(normalized_parts) >= numbered_items:
+        matched = True
+    if not matched and has_enumeration_colon and len(normalized_parts) >= 5:
+        matched = True
+
+    # Перечисление после двоеточия с несколькими пунктами через ';' считаем нормальной структурой, а не пере-дроблением.
+    if has_enumeration_colon and len(normalized_parts) >= 4 and semicolon_count >= len(normalized_parts) - 2:
+        short_count = 0
+        tiny_count = 0
+
+    score = 0
+    reasons: list[str] = []
+
+    if action_heads >= 2 and len(normalized_parts) == 1:
+        score += 4 if action_heads >= 3 else 3
+        reasons.append("несколько смысловых действий схлопнулись в одно атомарное высказывание")
+    elif action_heads >= 4 and len(normalized_parts) <= max(2, action_heads - 2):
+        score += 2
+        reasons.append("число сегментов заметно ниже числа смысловых действий в блоке")
+
+    if len(normalized_parts) >= 6 and short_count >= 3:
+        score += 3
+        reasons.append("возможна избыточная фрагментация на короткие сегменты")
+    elif len(normalized_parts) >= 4 and (short_count >= 2 or tiny_count >= 1):
+        score += 2
+        reasons.append("есть признаки пере-дробления блока")
+
+    if not matched and block_len >= 120 and (action_heads >= 2 or len(normalized_parts) >= 3):
+        score += 1
+        reasons.append("длинный структурно сложный блок не нашел уверенного совпадения в PDF")
+
+    if score <= 0:
+        return None
+
+    if score >= 4:
+        risk = "высокий риск"
+    elif score >= 2:
+        risk = "средний сигнал"
+    else:
+        risk = "слабый сигнал"
+
+    return {
+        "risk": risk,
+        "score": score,
+        "block_len": block_len,
+        "short_count": short_count,
+        "reasons": reasons,
+    }
+
+
+def build_pdf_segmentation_validation(
+    pdf_path: Path,
+    rough_blocks: list[str],
+    statements: list[Statement],
+) -> dict[str, object]:
+    raw_pdf = extract_text_from_pdf(pdf_path)
+    if raw_pdf is None:
+        return {
+            "enabled": False,
+            "reason": "PDF-check недоступен: файл PDF не найден или библиотека pypdf не установлена.",
+            "checked_blocks": 0,
+            "matched_blocks": 0,
+            "issues": [],
+            "risk_counts": {"высокий риск": 0, "средний сигнал": 0, "слабый сигнал": 0},
+        }
+
+    pdf_text = normalize_validation_text(raw_pdf)
+    grouped: dict[int, list[str]] = {}
+    for stmt in statements:
+        grouped.setdefault(stmt.parent_id, []).append(stmt.text)
+
+    issues: list[dict[str, object]] = []
+    risk_counts = {"высокий риск": 0, "средний сигнал": 0, "слабый сигнал": 0}
+    matched_blocks = 0
+    for parent_id, block in enumerate(rough_blocks, 1):
+        normalized_block = normalize_validation_text(block)
+        anchor = normalized_block[: min(140, len(normalized_block))]
+        matched = bool(anchor and len(anchor) >= 30 and anchor in pdf_text)
+        if matched:
+            matched_blocks += 1
+
+        parts = grouped.get(parent_id, [])
+        action_heads = count_action_heads(block)
+        classified = classify_pdf_validation_issue(block, parts, matched, action_heads)
+        if not classified:
             continue
-        # Если всё ещё очень длинное и есть «, и » — пробуем разрезать
-        if len(c) > 180 and ", и " in c:
-            subs = [s.strip() for s in re.split(r",\s+и\s+", c) if len(s.strip()) >= 8]
-            if len(subs) > 1:
-                result.extend(subs)
-                continue
-        result.append(c)
-    return result if result else ([text] if text.strip() else [])
+
+        risk = str(classified["risk"])
+        risk_counts[risk] += 1
+
+        # Подробно выводим только реально спорные блоки.
+        if risk == "слабый сигнал":
+            continue
+
+        issues.append(
+            {
+                "parent_id": parent_id,
+                "matched_in_pdf": matched,
+                "action_heads": action_heads,
+                "n_statements": len(parts),
+                "reasons": classified["reasons"],
+                "block": block,
+                "statements": parts,
+                "risk": risk,
+                "score": classified["score"],
+                "block_len": classified["block_len"],
+                "short_count": classified["short_count"],
+            }
+        )
+
+    return {
+        "enabled": True,
+        "reason": "",
+        "checked_blocks": len(rough_blocks),
+        "matched_blocks": matched_blocks,
+        "issues": issues,
+        "risk_counts": risk_counts,
+        "pdf_chars": len(raw_pdf),
+    }
+
+
+def write_pdf_validation_report(path: Path, validation: dict[str, object]) -> None:
+    lines = [
+        "Гибридная проверка сегментации: DOCX как основной источник, PDF как контрольный слой",
+        "",
+    ]
+
+    if not validation["enabled"]:
+        lines.append(str(validation["reason"]))
+        path.write_text("\n".join(lines), encoding="utf-8")
+        return
+
+    checked = int(validation["checked_blocks"])
+    matched = int(validation["matched_blocks"])
+    issues: list[dict[str, object]] = list(validation["issues"])
+    risk_counts: dict[str, int] = dict(validation["risk_counts"])
+    lines.extend(
+        [
+            f"Проверено исходных блоков: {checked}",
+            f"Уверенно сопоставлено с PDF: {matched}",
+            f"Высокий риск: {risk_counts['высокий риск']}",
+            f"Средний сигнал: {risk_counts['средний сигнал']}",
+            f"Слабый сигнал: {risk_counts['слабый сигнал']}",
+            f"Детально выведено действительно спорных блоков: {len(issues)}",
+            "",
+            "Логика фильтрации:",
+            "- короткие и тривиальные ответы не попадают в предупреждения;",
+            "- слабый сигнал считается, но не выводится подробно;",
+            "- подробно показываются только блоки со средним и высоким риском.",
+            "",
+        ]
+    )
+
+    for issue in issues[:80]:
+        lines.append(f"Блок #{issue['parent_id']}")
+        lines.append(f"- Уровень: {issue['risk']}")
+        lines.append(f"- Совпадение с PDF: {'да' if issue['matched_in_pdf'] else 'нет'}")
+        lines.append(f"- Количество смысловых действий: {issue['action_heads']}")
+        lines.append(f"- Получено атомарных высказываний: {issue['n_statements']}")
+        lines.append(f"- Коротких сегментов: {issue['short_count']}")
+        lines.append(f"- Причины: {'; '.join(issue['reasons'])}")
+        lines.append(f"- Исходный блок: {issue['block']}")
+        if issue["statements"]:
+            lines.append("- Сегменты:")
+            for segment in issue["statements"]:
+                lines.append(f"  * {segment}")
+        lines.append("")
+
+    path.write_text("\n".join(lines), encoding="utf-8")
 
 
 def build_corpus(raw_text: str) -> tuple[list[Statement], list[str]]:
